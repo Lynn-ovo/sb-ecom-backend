@@ -10,6 +10,8 @@ import com.ecommerce.project.repositories.*;
 import com.ecommerce.project.util.AuthUtil;
 import jakarta.transaction.Transactional;
 import org.modelmapper.ModelMapper;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -20,7 +22,7 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class OrderServiceImpl implements OrderService {
@@ -51,6 +53,9 @@ public class OrderServiceImpl implements OrderService {
 
     @Autowired
     AuthUtil authUtil;
+
+    @Autowired
+    RedissonClient redissonClient;
 
     @Override
     @Transactional
@@ -95,19 +100,47 @@ public class OrderServiceImpl implements OrderService {
 
         orderItems = orderItemRepository.saveAll(orderItems);
 
-        cart.getCartItems().forEach(item -> {
+        // Reduce stock quantity with distributed locking to prevent race conditions
+        // between concurrent orders on the same product
+        for (CartItem item : cart.getCartItems()) {
             int quantity = item.getQuantity();
-            Product product = item.getProduct();
+            Long productId = item.getProduct().getProductId();
 
-            // Reduce stock quantity
-            product.setQuantity(product.getQuantity() - quantity);
+            String lockKey = "stock_lock:" + productId;
+            RLock lock = redissonClient.getLock(lockKey);
 
-            // Save product back to the database
-            productRepository.save(product);
+            boolean isLocked;
+            try {
+                // Wait up to 5s to acquire the lock; hold it for at most 10s
+                // (safety net in case of an unexpected failure before unlock)
+                isLocked = lock.tryLock(5, 10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new APIException("Failed to acquire stock lock for product " + productId);
+            }
 
-            // Remove items from cart
-            cartService.deleteProductFromCart(cart.getCartId(), item.getProduct().getProductId());
-        });
+            if (!isLocked) {
+                throw new APIException("System busy, please try placing the order again.");
+            }
+
+            try {
+                // Re-read the product from the database inside the lock so we
+                // always check against the latest stock, not the cart's cached copy
+                Product product = productRepository.findById(productId)
+                        .orElseThrow(() -> new ResourceNotFoundException("Product", "productId", productId));
+
+                if (product.getQuantity() < quantity) {
+                    throw new APIException("Insufficient stock for product: " + product.getProductName());
+                }
+
+                product.setQuantity(product.getQuantity() - quantity);
+                productRepository.save(product);
+
+                cartService.deleteProductFromCart(cart.getCartId(), productId);
+            } finally {
+                lock.unlock();
+            }
+        }
 
         OrderDTO orderDTO = modelMapper.map(savedOrder, OrderDTO.class);
         orderItems.forEach(item -> orderDTO.getOrderItems().add(modelMapper.map(item, OrderItemDTO.class)));
@@ -182,6 +215,5 @@ public class OrderServiceImpl implements OrderService {
         orderResponse.setLastPage(pageOrders.isLast());
         return orderResponse;
     }
-
 
 }
